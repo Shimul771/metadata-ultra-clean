@@ -1,0 +1,27 @@
+{
+  "name": "backend-server",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Shimul0044/Image-to-accurate-prompt.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Shimul0044/Image-to-accurate-prompt/issues"
+  },
+  "homepage": "https://github.com/Shimul0044/Image-to-accurate-prompt#readme",
+  "description": "",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "mongoose": "^8.16.1",
+    "uuid": "^11.1.0"
+  }
+}
