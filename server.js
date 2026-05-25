@@ -1,11 +1,6 @@
-
 // server.js (License + Products API)
-
-// A safer, explicit server that uses fixed MongoDB collections:
-// - licenses
-// - products
-// It supports both `licenseKey` and `key` request fields so the
-// extension and MongoDB screenshots can use the same data model.
+// Robust version that can read the correct MongoDB database/collection
+// even when the connection URI or deployment environment is inconsistent.
 
 const express = require('express');
 const cors = require('cors');
@@ -13,26 +8,40 @@ const mongoose = require('mongoose');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const ADMIN_API_KEY = process.env.ADMIN_API_KEY || '27168';
-const MONGO_URI = process.env.MONGO_URI || 'mongodb+srv://user:pass@cluster.mongodb.net/dbname';
+const ADMIN_API_KEY = (process.env.ADMIN_API_KEY || '27168').toString().trim();
+const MONGO_URI = (process.env.MONGO_URI || 'mongodb+srv://user:pass@cluster.mongodb.net/test').toString().trim();
 
 app.use(cors());
 app.use(express.json());
 
+function getDbNameFromUri(uri) {
+  try {
+    const parsed = new URL(uri);
+    const pathname = (parsed.pathname || '').replace(/^\/+/, '').trim();
+    return pathname || 'test';
+  } catch (err) {
+    return 'test';
+  }
+}
+
+const PREFERRED_DB_NAME = getDbNameFromUri(MONGO_URI);
+
 mongoose
   .connect(MONGO_URI)
-  .then(() => console.log('MongoDB database connected successfully!'))
+  .then(() => {
+    console.log('MongoDB database connected successfully!');
+    console.log('Preferred DB name:', PREFERRED_DB_NAME);
+  })
   .catch(err => console.error('MongoDB connection error:', err));
 
-async function getDb() {
+async function ensureConnected() {
   if (mongoose.connection.readyState !== 1) {
     await mongoose.connection.asPromise();
   }
-  return mongoose.connection.db;
 }
 
 function requireAdmin(req, res, next) {
-  const apiKey = req.headers['x-api-key'];
+  const apiKey = (req.headers['x-api-key'] || '').toString().trim();
   if (apiKey !== ADMIN_API_KEY) {
     return res.status(401).json({ message: 'Unauthorized: Admin API key is missing or incorrect.' });
   }
@@ -64,16 +73,6 @@ function toInt(value, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-async function licensesCollection() {
-  const db = await getDb();
-  return db.collection('licenses');
-}
-
-async function productsCollection() {
-  const db = await getDb();
-  return db.collection('products');
-}
-
 function buildExpiry(activatedOn, durationDays) {
   if (!activatedOn || !durationDays) return null;
   const start = new Date(activatedOn);
@@ -81,8 +80,107 @@ function buildExpiry(activatedOn, durationDays) {
   return new Date(start.getTime() + (Number(durationDays) * 24 * 60 * 60 * 1000));
 }
 
+async function getCandidateDbs() {
+  await ensureConnected();
+
+  const client = mongoose.connection.getClient ? mongoose.connection.getClient() : mongoose.connection.client;
+  const names = new Set();
+
+  const connectedName = mongoose.connection.db && mongoose.connection.db.databaseName;
+  if (connectedName) names.add(connectedName);
+
+  if (PREFERRED_DB_NAME) names.add(PREFERRED_DB_NAME);
+  names.add('test');
+
+  return Array.from(names)
+    .filter(Boolean)
+    .map((name) => client.db(name));
+}
+
+async function findLicenseByKey(key) {
+  const dbs = await getCandidateDbs();
+  for (const db of dbs) {
+    const license = await db.collection('licenses').findOne({ key });
+    if (license) return { db, license };
+  }
+  return { db: null, license: null };
+}
+
+async function listLicensesAcrossDbs() {
+  const dbs = await getCandidateDbs();
+  const seen = new Set();
+  const out = [];
+
+  for (const db of dbs) {
+    const docs = await db.collection('licenses').find({}).toArray();
+    for (const doc of docs) {
+      const id = doc?._id?.toString?.() || JSON.stringify(doc);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push(doc);
+    }
+  }
+
+  return out;
+}
+
+async function listProductsAcrossDbs() {
+  const dbs = await getCandidateDbs();
+  const seen = new Set();
+  const out = [];
+
+  for (const db of dbs) {
+    const docs = await db.collection('products').find({}).sort({ sortOrder: 1, updatedAt: -1, _id: 1 }).toArray();
+    for (const doc of docs) {
+      const id = doc?._id?.toString?.() || JSON.stringify(doc);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push(doc);
+    }
+  }
+
+  return out;
+}
+
+async function findProductByIdAcrossDbs(id) {
+  const dbs = await getCandidateDbs();
+  if (!mongoose.Types.ObjectId.isValid(id)) return { db: null, product: null, objectId: null };
+  const objectId = new mongoose.Types.ObjectId(id);
+
+  for (const db of dbs) {
+    const product = await db.collection('products').findOne({ _id: objectId });
+    if (product) return { db, product, objectId };
+  }
+
+  return { db: null, product: null, objectId };
+}
+
 app.get('/api/health', (req, res) => {
   res.json({ ok: true });
+});
+
+// Public debug route to verify what database the server can see.
+app.get('/api/debug/db-info', async (req, res) => {
+  try {
+    const dbs = await getCandidateDbs();
+    const info = [];
+    for (const db of dbs) {
+      const [products, licenses] = await Promise.all([
+        db.collection('products').countDocuments({}),
+        db.collection('licenses').countDocuments({}),
+      ]);
+      info.push({ db: db.databaseName, products, licenses });
+    }
+    res.json({
+      connected: mongoose.connection.readyState === 1,
+      preferredDbName: PREFERRED_DB_NAME,
+      envDbName: PREFERRED_DB_NAME,
+      databases: info,
+    });
+  } catch (error) {
+    console.error('Debug DB info error:', error);
+    res.status(500).json({ message: 'Failed to read db info' });
+  }
 });
 
 // --- License Activation Endpoint ---
@@ -95,8 +193,9 @@ app.post('/api/activate', async (req, res) => {
   }
 
   try {
-    const licenses = await licensesCollection();
-    const license = await licenses.findOne({ key: licenseKey });
+    const result = await findLicenseByKey(licenseKey);
+    const license = result.license;
+    const db = result.db;
 
     if (!license) {
       return res.status(404).json({ message: 'License key not found or invalid.' });
@@ -106,17 +205,15 @@ app.post('/api/activate', async (req, res) => {
       return res.status(403).json({ message: 'This license key is already in use on another device.' });
     }
 
-    // If the key is already activated on this device, keep it as-is.
-    // Otherwise bind it to the current device and set activation time.
-    let activatedOn = license.activated_on || new Date();
-    let deviceToStore = license.device_id || deviceId;
+    const activatedOn = license.activated_on || new Date();
+    const deviceToStore = license.device_id || deviceId;
 
     const expiry = buildExpiry(activatedOn, license.duration_days);
     if (expiry && new Date() > expiry) {
       return res.status(403).json({ message: 'This license has already expired.' });
     }
 
-    await licenses.updateOne(
+    await db.collection('licenses').updateOne(
       { _id: license._id },
       {
         $set: {
@@ -147,8 +244,8 @@ app.post('/api/validate', async (req, res) => {
   }
 
   try {
-    const licenses = await licensesCollection();
-    const license = await licenses.findOne({ key: licenseKey });
+    const result = await findLicenseByKey(licenseKey);
+    const license = result.license;
 
     if (!license) {
       return res.status(200).json({ valid: false, message: 'Invalid or deactivated license.' });
@@ -182,16 +279,15 @@ app.post('/api/deactivate', requireAdmin, async (req, res) => {
   }
 
   try {
-    const licenses = await licensesCollection();
-    const result = await licenses.findOneAndUpdate(
-      { key: licenseKey },
-      { $set: { device_id: null, activated_on: null } },
-      { returnDocument: 'after' }
-    );
-
-    if (!result || !result.value) {
+    const result = await findLicenseByKey(licenseKey);
+    if (!result.license || !result.db) {
       return res.status(404).json({ message: 'License key not found.' });
     }
+
+    await result.db.collection('licenses').updateOne(
+      { _id: result.license._id },
+      { $set: { device_id: null, activated_on: null } }
+    );
 
     return res.status(200).json({ message: `License ${licenseKey} has been successfully deactivated.` });
   } catch (error) {
@@ -203,8 +299,7 @@ app.post('/api/deactivate', requireAdmin, async (req, res) => {
 // --- Admin Endpoint: Get status of all keys ---
 app.get('/api/status', requireAdmin, async (req, res) => {
   try {
-    const licenses = await licensesCollection();
-    const allLicenses = await licenses.find({}).toArray();
+    const allLicenses = await listLicensesAcrossDbs();
     return res.status(200).json(allLicenses);
   } catch (error) {
     console.error('Status Fetch Error:', error);
@@ -215,14 +310,7 @@ app.get('/api/status', requireAdmin, async (req, res) => {
 // --- Public products endpoint ---
 app.get('/api/products', async (req, res) => {
   try {
-    const products = await productsCollection();
-
-    // Return every product document so the UI can show active ones
-    // and also reserve placeholders for inactive or partial entries.
-    const list = await products
-      .find({})
-      .sort({ sortOrder: 1, updatedAt: -1, _id: 1 })
-      .toArray();
+    const list = await listProductsAcrossDbs();
 
     return res.json({
       products: list.map(p => ({
@@ -254,7 +342,8 @@ app.post('/api/products', requireAdmin, async (req, res) => {
       return res.status(400).json({ message: 'name, price, and image are required.' });
     }
 
-    const products = await productsCollection();
+    const dbs = await getCandidateDbs();
+    const db = dbs[0];
     const doc = {
       name: String(name).trim(),
       price: String(price).trim(),
@@ -266,7 +355,7 @@ app.post('/api/products', requireAdmin, async (req, res) => {
       updatedAt: new Date(),
     };
 
-    const result = await products.insertOne(doc);
+    const result = await db.collection('products').insertOne(doc);
     return res.json({ ...doc, _id: result.insertedId, id: result.insertedId });
   } catch (error) {
     console.error('Create Product Error:', error);
@@ -276,7 +365,11 @@ app.post('/api/products', requireAdmin, async (req, res) => {
 
 app.put('/api/products/:id', requireAdmin, async (req, res) => {
   try {
-    const products = await productsCollection();
+    const result = await findProductByIdAcrossDbs(req.params.id);
+    if (!result.product || !result.db) {
+      return res.status(404).json({ message: 'Product not found.' });
+    }
+
     const update = { ...req.body };
 
     if (Object.prototype.hasOwnProperty.call(update, 'sortOrder')) {
@@ -289,17 +382,13 @@ app.put('/api/products/:id', requireAdmin, async (req, res) => {
     if (Object.prototype.hasOwnProperty.call(update, 'description')) update.description = String(update.description).trim();
     update.updatedAt = new Date();
 
-    const result = await products.findOneAndUpdate(
-      { _id: new mongoose.Types.ObjectId(req.params.id) },
-      { $set: update },
-      { returnDocument: 'after' }
+    await result.db.collection('products').updateOne(
+      { _id: result.objectId },
+      { $set: update }
     );
 
-    if (!result || !result.value) {
-      return res.status(404).json({ message: 'Product not found.' });
-    }
-
-    return res.json(result.value);
+    const updated = await result.db.collection('products').findOne({ _id: result.objectId });
+    return res.json(updated);
   } catch (error) {
     console.error('Update Product Error:', error);
     return res.status(500).json({ message: 'Update failed' });
@@ -308,8 +397,12 @@ app.put('/api/products/:id', requireAdmin, async (req, res) => {
 
 app.delete('/api/products/:id', requireAdmin, async (req, res) => {
   try {
-    const products = await productsCollection();
-    const deleted = await products.deleteOne({ _id: new mongoose.Types.ObjectId(req.params.id) });
+    const result = await findProductByIdAcrossDbs(req.params.id);
+    if (!result.product || !result.db) {
+      return res.status(404).json({ message: 'Product not found.' });
+    }
+
+    const deleted = await result.db.collection('products').deleteOne({ _id: result.objectId });
     if (!deleted.deletedCount) {
       return res.status(404).json({ message: 'Product not found.' });
     }
@@ -320,14 +413,20 @@ app.delete('/api/products/:id', requireAdmin, async (req, res) => {
   }
 });
 
-
 app.get('/api/debug/products-count', requireAdmin, async (req, res) => {
   try {
-    const products = await productsCollection();
-    const total = await products.countDocuments({});
-    const active = await products.countDocuments({ active: true });
-    const inactive = await products.countDocuments({ active: false });
-    return res.json({ total, active, inactive });
+    const dbs = await getCandidateDbs();
+    const details = [];
+    for (const db of dbs) {
+      const total = await db.collection('products').countDocuments({});
+      const active = await db.collection('products').countDocuments({ active: true });
+      const inactive = await db.collection('products').countDocuments({ active: false });
+      details.push({ db: db.databaseName, total, active, inactive });
+    }
+    return res.json({
+      preferredDbName: PREFERRED_DB_NAME,
+      details,
+    });
   } catch (error) {
     console.error('Debug products count error:', error);
     return res.status(500).json({ message: 'Failed to count products' });
