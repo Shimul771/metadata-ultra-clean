@@ -216,9 +216,12 @@ app.get('/api/status', requireAdmin, async (req, res) => {
 app.get('/api/products', async (req, res) => {
   try {
     const products = await productsCollection();
+
+    // Return every product document so the UI can show active ones
+    // and also reserve placeholders for inactive or partial entries.
     const list = await products
-      .find({ active: true })
-      .sort({ sortOrder: 1, _id: 1 })
+      .find({})
+      .sort({ sortOrder: 1, updatedAt: -1, _id: 1 })
       .toArray();
 
     return res.json({
@@ -234,6 +237,7 @@ app.get('/api/products', async (req, res) => {
         description: p.description || '',
         updatedAt: p.updatedAt || null,
       })),
+      count: list.length,
     });
   } catch (error) {
     console.error('Products Fetch Error:', error);
@@ -313,6 +317,20 @@ app.delete('/api/products/:id', requireAdmin, async (req, res) => {
   } catch (error) {
     console.error('Delete Product Error:', error);
     return res.status(500).json({ message: 'Delete failed' });
+  }
+});
+
+
+app.get('/api/debug/products-count', requireAdmin, async (req, res) => {
+  try {
+    const products = await productsCollection();
+    const total = await products.countDocuments({});
+    const active = await products.countDocuments({ active: true });
+    const inactive = await products.countDocuments({ active: false });
+    return res.json({ total, active, inactive });
+  } catch (error) {
+    console.error('Debug products count error:', error);
+    return res.status(500).json({ message: 'Failed to count products' });
   }
 });
 
