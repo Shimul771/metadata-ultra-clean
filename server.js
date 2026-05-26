@@ -5,11 +5,14 @@
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
+const TelegramBot = require('node-telegram-bot-api');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const ADMIN_API_KEY = (process.env.ADMIN_API_KEY || '27168').toString().trim();
 const MONGO_URI = (process.env.MONGO_URI || 'mongodb+srv://user:pass@cluster.mongodb.net/test').toString().trim();
+const BOT_TOKEN = (process.env.BOT_TOKEN || '').toString().trim();
+const TG_ADMIN_IDS = (process.env.TG_ADMIN_IDS || '').toString().trim();
 
 app.use(cors());
 app.use(express.json());
@@ -46,6 +49,76 @@ function requireAdmin(req, res, next) {
     return res.status(401).json({ message: 'Unauthorized: Admin API key is missing or incorrect.' });
   }
   next();
+}
+
+function parseAllowedTelegramIds(value) {
+  return value
+    .split(',')
+    .map((v) => v.trim())
+    .filter(Boolean)
+    .map((v) => Number(v))
+    .filter((v) => Number.isFinite(v));
+}
+
+function isTelegramAdmin(msg) {
+  const allowed = parseAllowedTelegramIds(TG_ADMIN_IDS);
+  if (!allowed.length) return true; // Allow until IDs are configured.
+  return allowed.includes(Number(msg?.from?.id));
+}
+
+function telegramReply(bot, chatId, text) {
+  return bot.sendMessage(chatId, text, { disable_web_page_preview: true });
+}
+
+async function insertLicenseByKey(key, durationDays) {
+  const dbs = await getCandidateDbs();
+  const db = dbs[0];
+  const exists = await db.collection('licenses').findOne({ key });
+  if (exists) {
+    return { ok: false, message: 'License key already exists.' };
+  }
+  const doc = {
+    key,
+    duration_days: toInt(durationDays, 30),
+    activated_on: null,
+    device_id: null,
+  };
+  const result = await db.collection('licenses').insertOne(doc);
+  return { ok: true, insertedId: result.insertedId, doc: { ...doc, _id: result.insertedId } };
+}
+
+async function insertProduct(doc) {
+  const dbs = await getCandidateDbs();
+  const db = dbs[0];
+  const payload = {
+    name: String(doc.name || '').trim(),
+    price: String(doc.price || '').trim(),
+    image: String(doc.image || '').trim(),
+    buyLink: doc.buyLink ? String(doc.buyLink).trim() : '#',
+    description: doc.description ? String(doc.description).trim() : '',
+    active: typeof doc.active === 'boolean' ? doc.active : true,
+    sortOrder: toInt(doc.sortOrder, 0),
+    updatedAt: new Date(),
+  };
+  if (!payload.name || !payload.price || !payload.image) {
+    throw new Error('name, price, and image are required.');
+  }
+  const result = await db.collection('products').insertOne(payload);
+  return { ...payload, _id: result.insertedId, id: result.insertedId };
+}
+
+function parseProductCommand(rawText) {
+  const payload = (rawText || '').replace(/^\/addproduct\s*/i, '');
+  const parts = payload.split('|').map((p) => p.trim()).filter(Boolean);
+  return {
+    name: parts[0] || '',
+    price: parts[1] || '',
+    image: parts[2] || '',
+    buyLink: parts[3] || '#',
+    active: parts[4] ? !/^(false|0|no|off)$/i.test(parts[4]) : true,
+    sortOrder: parts[5] || 0,
+    description: parts[6] || '',
+  };
 }
 
 function readLicenseKey(body = {}) {
@@ -432,6 +505,105 @@ app.get('/api/debug/products-count', requireAdmin, async (req, res) => {
     return res.status(500).json({ message: 'Failed to count products' });
   }
 });
+
+
+function startTelegramBot() {
+  if (!BOT_TOKEN) {
+    console.log('Telegram bot is disabled (BOT_TOKEN not set).');
+    return;
+  }
+
+  const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+
+  bot.onText(/^\/start$/i, async (msg) => {
+    if (!isTelegramAdmin(msg)) return telegramReply(bot, msg.chat.id, 'Unauthorized.');
+    await telegramReply(
+      bot,
+      msg.chat.id,
+      [
+        'Bot is ready.',
+        '',
+        'Commands:',
+        '/addlicense KEY DAYS',
+        '/addproduct Name | Price | ImageURL | BuyLink | Active(true/false) | SortOrder | Description',
+      ].join('\n')
+    );
+  });
+
+  bot.onText(/^\/help$/i, async (msg) => {
+    if (!isTelegramAdmin(msg)) return telegramReply(bot, msg.chat.id, 'Unauthorized.');
+    await telegramReply(
+      bot,
+      msg.chat.id,
+      [
+        'Use these commands:',
+        '/addlicense KEY DAYS',
+        '/addproduct Name | Price | ImageURL | BuyLink | Active(true/false) | SortOrder | Description',
+      ].join('\n')
+    );
+  });
+
+  bot.onText(/^\/addlicense(?:\s+(.+?))(?:\s+(\d+))?$/i, async (msg, match) => {
+    if (!isTelegramAdmin(msg)) return telegramReply(bot, msg.chat.id, 'Unauthorized.');
+
+    try {
+      const key = (match?.[1] || '').trim();
+      const days = toInt(match?.[2], 30);
+      if (!key) {
+        return telegramReply(bot, msg.chat.id, 'Usage: /addlicense KEY DAYS');
+      }
+
+      const result = await insertLicenseByKey(key, days);
+      if (!result.ok) {
+        return telegramReply(bot, msg.chat.id, result.message);
+      }
+
+      await telegramReply(
+        bot,
+        msg.chat.id,
+        `License added:\nKey: ${key}\nDays: ${days}`
+      );
+    } catch (error) {
+      console.error('Telegram addlicense error:', error);
+      await telegramReply(bot, msg.chat.id, `Error: ${error.message}`);
+    }
+  });
+
+  bot.onText(/^\/addproduct(?:\s+(.+))?$/i, async (msg) => {
+    if (!isTelegramAdmin(msg)) return telegramReply(bot, msg.chat.id, 'Unauthorized.');
+
+    try {
+      const raw = msg.text || '';
+      const doc = parseProductCommand(raw);
+
+      if (!doc.name || !doc.price || !doc.image) {
+        return telegramReply(
+          bot,
+          msg.chat.id,
+          'Usage: /addproduct Name | Price | ImageURL | BuyLink | Active(true/false) | SortOrder | Description'
+        );
+      }
+
+      const product = await insertProduct(doc);
+      await telegramReply(
+        bot,
+        msg.chat.id,
+        `Product added:\nName: ${product.name}\nPrice: ${product.price}`
+      );
+    } catch (error) {
+      console.error('Telegram addproduct error:', error);
+      await telegramReply(bot, msg.chat.id, `Error: ${error.message}`);
+    }
+  });
+
+  bot.on('polling_error', (error) => {
+    console.error('Telegram polling error:', error?.message || error);
+  });
+
+  console.log('Telegram bot started.');
+}
+
+startTelegramBot();
 
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
