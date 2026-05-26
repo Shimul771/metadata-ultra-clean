@@ -5,14 +5,18 @@
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
-const TelegramBot = require('node-telegram-bot-api');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const ADMIN_API_KEY = (process.env.ADMIN_API_KEY || '27168').toString().trim();
 const MONGO_URI = (process.env.MONGO_URI || 'mongodb+srv://user:pass@cluster.mongodb.net/test').toString().trim();
 const BOT_TOKEN = (process.env.BOT_TOKEN || '').toString().trim();
-const TG_ADMIN_IDS = (process.env.TG_ADMIN_IDS || '').toString().trim();
+const TG_ADMIN_IDS = (process.env.TG_ADMIN_IDS || '')
+  .toString()
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 app.use(cors());
 app.use(express.json());
@@ -51,76 +55,6 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-function parseAllowedTelegramIds(value) {
-  return value
-    .split(',')
-    .map((v) => v.trim())
-    .filter(Boolean)
-    .map((v) => Number(v))
-    .filter((v) => Number.isFinite(v));
-}
-
-function isTelegramAdmin(msg) {
-  const allowed = parseAllowedTelegramIds(TG_ADMIN_IDS);
-  if (!allowed.length) return true; // Allow until IDs are configured.
-  return allowed.includes(Number(msg?.from?.id));
-}
-
-function telegramReply(bot, chatId, text) {
-  return bot.sendMessage(chatId, text, { disable_web_page_preview: true });
-}
-
-async function insertLicenseByKey(key, durationDays) {
-  const dbs = await getCandidateDbs();
-  const db = dbs[0];
-  const exists = await db.collection('licenses').findOne({ key });
-  if (exists) {
-    return { ok: false, message: 'License key already exists.' };
-  }
-  const doc = {
-    key,
-    duration_days: toInt(durationDays, 30),
-    activated_on: null,
-    device_id: null,
-  };
-  const result = await db.collection('licenses').insertOne(doc);
-  return { ok: true, insertedId: result.insertedId, doc: { ...doc, _id: result.insertedId } };
-}
-
-async function insertProduct(doc) {
-  const dbs = await getCandidateDbs();
-  const db = dbs[0];
-  const payload = {
-    name: String(doc.name || '').trim(),
-    price: String(doc.price || '').trim(),
-    image: String(doc.image || '').trim(),
-    buyLink: doc.buyLink ? String(doc.buyLink).trim() : '#',
-    description: doc.description ? String(doc.description).trim() : '',
-    active: typeof doc.active === 'boolean' ? doc.active : true,
-    sortOrder: toInt(doc.sortOrder, 0),
-    updatedAt: new Date(),
-  };
-  if (!payload.name || !payload.price || !payload.image) {
-    throw new Error('name, price, and image are required.');
-  }
-  const result = await db.collection('products').insertOne(payload);
-  return { ...payload, _id: result.insertedId, id: result.insertedId };
-}
-
-function parseProductCommand(rawText) {
-  const payload = (rawText || '').replace(/^\/addproduct\s*/i, '');
-  const parts = payload.split('|').map((p) => p.trim()).filter(Boolean);
-  return {
-    name: parts[0] || '',
-    price: parts[1] || '',
-    image: parts[2] || '',
-    buyLink: parts[3] || '#',
-    active: parts[4] ? !/^(false|0|no|off)$/i.test(parts[4]) : true,
-    sortOrder: parts[5] || 0,
-    description: parts[6] || '',
-  };
-}
-
 function readLicenseKey(body = {}) {
   return (
     body.licenseKey ||
@@ -144,6 +78,179 @@ function readDeviceId(body = {}) {
 function toInt(value, fallback = 0) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
+}
+
+function isTelegramAdmin(telegramUserId) {
+  if (!TG_ADMIN_IDS.length) return false;
+  return TG_ADMIN_IDS.includes(String(telegramUserId));
+}
+
+function makeSecureLicenseKey(groups = 5, charsPerGroup = 4) {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const bytes = crypto.randomBytes(groups * charsPerGroup);
+  const parts = [];
+  let cursor = 0;
+
+  for (let g = 0; g < groups; g += 1) {
+    let piece = '';
+    for (let c = 0; c < charsPerGroup; c += 1) {
+      piece += alphabet[bytes[cursor] % alphabet.length];
+      cursor += 1;
+    }
+    parts.push(piece);
+  }
+
+  return parts.join('-');
+}
+
+async function sendTelegramMessage(chatId, text) {
+  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+  await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true }),
+  });
+}
+
+async function sendTelegramChunked(chatId, text) {
+  const limit = 3800;
+  const chunks = [];
+  let current = '';
+
+  for (const line of String(text).split('\n')) {
+    const next = current ? `${current}\n${line}` : line;
+    if (next.length > limit) {
+      if (current) chunks.push(current);
+      current = line;
+    } else {
+      current = next;
+    }
+  }
+
+  if (current) chunks.push(current);
+  for (const chunk of chunks) {
+    // eslint-disable-next-line no-await-in-loop
+    await sendTelegramMessage(chatId, chunk);
+  }
+}
+
+async function getPrimaryDb() {
+
+  await ensureConnected();
+  const client = mongoose.connection.getClient ? mongoose.connection.getClient() : mongoose.connection.client;
+  return client.db(PREFERRED_DB_NAME || 'test');
+}
+
+async function startTelegramBot() {
+  if (!BOT_TOKEN) {
+    console.log('Telegram bot is disabled: BOT_TOKEN not provided.');
+    return;
+  }
+
+  if (!TG_ADMIN_IDS.length) {
+    console.log('Telegram bot is disabled: TG_ADMIN_IDS not provided.');
+    return;
+  }
+
+  console.log('Telegram bot enabled for admin IDs:', TG_ADMIN_IDS.join(', '));
+
+  let offset = 0;
+  let polling = false;
+
+  const processUpdate = async (update) => {
+    const msg = update.message || update.edited_message;
+    if (!msg || !msg.text) return;
+    const chatId = msg.chat?.id;
+    const userId = msg.from?.id;
+    const text = msg.text.trim();
+
+    if (!isTelegramAdmin(userId)) {
+      await sendTelegramMessage(chatId, 'Unauthorized.');
+      return;
+    }
+
+    if (/^\/start(?:@\w+)?$/i.test(text)) {
+      await sendTelegramMessage(chatId, 'Bot ready. Commands: /gen COUNT DAYS, /resetlicense KEY');
+      return;
+    }
+
+    const genMatch = text.match(/^\/gen(?:@\w+)?\s+(\d+)\s+(\d+)$/i);
+    if (genMatch) {
+      const count = Math.max(1, Math.min(200, parseInt(genMatch[1], 10) || 0));
+      const days = Math.max(1, Math.min(3650, parseInt(genMatch[2], 10) || 0));
+      const db = await getPrimaryDb();
+      const keys = [];
+
+      for (let i = 0; i < count; i += 1) {
+        let key = makeSecureLicenseKey();
+        // Ensure unique key in the primary db. Retry a few times if needed.
+        for (let attempt = 0; attempt < 5; attempt += 1) {
+          // eslint-disable-next-line no-await-in-loop
+          const exists = await db.collection('licenses').findOne({ key });
+          if (!exists) break;
+          key = makeSecureLicenseKey();
+        }
+
+        // eslint-disable-next-line no-await-in-loop
+        await db.collection('licenses').insertOne({
+          key,
+          duration_days: days,
+          activated_on: null,
+          device_id: null,
+          created_at: new Date(),
+        });
+        keys.push(key);
+      }
+
+      await sendTelegramChunked(chatId, `Generated ${keys.length} license keys (${days} days):\n\n${keys.join('\n')}`);
+      return;
+    }
+
+    const resetMatch = text.match(/^\/resetlicense(?:@\w+)?\s+(.+)$/i);
+    if (resetMatch) {
+      const key = resetMatch[1].trim();
+      const result = await findLicenseByKey(key);
+
+      if (!result.license || !result.db) {
+        await sendTelegramMessage(chatId, `License not found: ${key}`);
+        return;
+      }
+
+      await result.db.collection('licenses').updateOne(
+        { _id: result.license._id },
+        { $set: { device_id: null } }
+      );
+
+      await sendTelegramMessage(chatId, `Device reset done for: ${key}`);
+      return;
+    }
+
+    await sendTelegramMessage(chatId, 'Commands: /gen COUNT DAYS, /resetlicense KEY');
+  };
+
+  const poll = async () => {
+    if (polling) return;
+    polling = true;
+    try {
+      const url = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?timeout=0&offset=${offset}`;
+      const resp = await fetch(url);
+      const data = await resp.json();
+      if (data.ok && Array.isArray(data.result)) {
+        for (const update of data.result) {
+          offset = Math.max(offset, (update.update_id || 0) + 1);
+          // eslint-disable-next-line no-await-in-loop
+          await processUpdate(update);
+        }
+      }
+    } catch (error) {
+      console.error('Telegram bot polling error:', error);
+    } finally {
+      polling = false;
+    }
+  };
+
+  await poll();
+  setInterval(poll, 3000);
 }
 
 function buildExpiry(activatedOn, durationDays) {
@@ -506,104 +613,9 @@ app.get('/api/debug/products-count', requireAdmin, async (req, res) => {
   }
 });
 
-
-function startTelegramBot() {
-  if (!BOT_TOKEN) {
-    console.log('Telegram bot is disabled (BOT_TOKEN not set).');
-    return;
-  }
-
-  const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-
-  bot.onText(/^\/start$/i, async (msg) => {
-    if (!isTelegramAdmin(msg)) return telegramReply(bot, msg.chat.id, 'Unauthorized.');
-    await telegramReply(
-      bot,
-      msg.chat.id,
-      [
-        'Bot is ready.',
-        '',
-        'Commands:',
-        '/addlicense KEY DAYS',
-        '/addproduct Name | Price | ImageURL | BuyLink | Active(true/false) | SortOrder | Description',
-      ].join('\n')
-    );
-  });
-
-  bot.onText(/^\/help$/i, async (msg) => {
-    if (!isTelegramAdmin(msg)) return telegramReply(bot, msg.chat.id, 'Unauthorized.');
-    await telegramReply(
-      bot,
-      msg.chat.id,
-      [
-        'Use these commands:',
-        '/addlicense KEY DAYS',
-        '/addproduct Name | Price | ImageURL | BuyLink | Active(true/false) | SortOrder | Description',
-      ].join('\n')
-    );
-  });
-
-  bot.onText(/^\/addlicense(?:\s+(.+?))(?:\s+(\d+))?$/i, async (msg, match) => {
-    if (!isTelegramAdmin(msg)) return telegramReply(bot, msg.chat.id, 'Unauthorized.');
-
-    try {
-      const key = (match?.[1] || '').trim();
-      const days = toInt(match?.[2], 30);
-      if (!key) {
-        return telegramReply(bot, msg.chat.id, 'Usage: /addlicense KEY DAYS');
-      }
-
-      const result = await insertLicenseByKey(key, days);
-      if (!result.ok) {
-        return telegramReply(bot, msg.chat.id, result.message);
-      }
-
-      await telegramReply(
-        bot,
-        msg.chat.id,
-        `License added:\nKey: ${key}\nDays: ${days}`
-      );
-    } catch (error) {
-      console.error('Telegram addlicense error:', error);
-      await telegramReply(bot, msg.chat.id, `Error: ${error.message}`);
-    }
-  });
-
-  bot.onText(/^\/addproduct(?:\s+(.+))?$/i, async (msg) => {
-    if (!isTelegramAdmin(msg)) return telegramReply(bot, msg.chat.id, 'Unauthorized.');
-
-    try {
-      const raw = msg.text || '';
-      const doc = parseProductCommand(raw);
-
-      if (!doc.name || !doc.price || !doc.image) {
-        return telegramReply(
-          bot,
-          msg.chat.id,
-          'Usage: /addproduct Name | Price | ImageURL | BuyLink | Active(true/false) | SortOrder | Description'
-        );
-      }
-
-      const product = await insertProduct(doc);
-      await telegramReply(
-        bot,
-        msg.chat.id,
-        `Product added:\nName: ${product.name}\nPrice: ${product.price}`
-      );
-    } catch (error) {
-      console.error('Telegram addproduct error:', error);
-      await telegramReply(bot, msg.chat.id, `Error: ${error.message}`);
-    }
-  });
-
-  bot.on('polling_error', (error) => {
-    console.error('Telegram polling error:', error?.message || error);
-  });
-
-  console.log('Telegram bot started.');
-}
-
-startTelegramBot();
+startTelegramBot().catch((error) => {
+  console.error('Telegram bot start error:', error);
+});
 
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
