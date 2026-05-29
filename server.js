@@ -111,10 +111,18 @@ function daysUntil(dateValue) {
 }
 
 function getLicensePromoHidden(license = {}) {
+  if (!license || typeof license !== 'object') return false;
   return license.hideAiToolsPromo === true ||
     license.hide_ai_tools_promo === true ||
+    license.hideAiTools === true ||
+    license.hide_ai_tools === true ||
     license.hideAiToolsInExpiryPopup === true ||
-    license.showAiToolsInExpiryPopup === false;
+    license.hide_ai_tools_in_expiry_popup === true ||
+    license.showAiToolsInExpiryPopup === false ||
+    license.show_ai_tools_in_expiry_popup === false ||
+    license.showAiTools === false ||
+    license.aiToolsVisible === false ||
+    getLicensePromoHidden(license.flags || null);
 }
 
 function getEnvExtensionSettings() {
@@ -255,7 +263,12 @@ async function createLicenseKeys(count, days, options = {}) {
       activated_on: null,
       device_id: null,
       hideAiToolsPromo,
+      hide_ai_tools_promo: hideAiToolsPromo,
+      hideAiTools: hideAiToolsPromo,
       showAiToolsInExpiryPopup: !hideAiToolsPromo,
+      showAiTools: !hideAiToolsPromo,
+      aiToolsVisible: !hideAiToolsPromo,
+      flags: { hideAiToolsPromo, hideAiTools: hideAiToolsPromo },
       created_at: new Date(),
       source: options.source || 'telegram',
     });
@@ -270,9 +283,18 @@ async function updateLicensePromoFlag(key, hideAiToolsPromo) {
   if (!result.license || !result.db) return null;
   await result.db.collection('licenses').updateOne(
     { _id: result.license._id },
-    { $set: { hideAiToolsPromo, showAiToolsInExpiryPopup: !hideAiToolsPromo, updated_at: new Date() } }
+    { $set: {
+      hideAiToolsPromo,
+      hide_ai_tools_promo: hideAiToolsPromo,
+      hideAiTools: hideAiToolsPromo,
+      showAiToolsInExpiryPopup: !hideAiToolsPromo,
+      showAiTools: !hideAiToolsPromo,
+      aiToolsVisible: !hideAiToolsPromo,
+      flags: { hideAiToolsPromo, hideAiTools: hideAiToolsPromo },
+      updated_at: new Date()
+    } }
   );
-  return { ...result.license, hideAiToolsPromo, showAiToolsInExpiryPopup: !hideAiToolsPromo };
+  return { ...result.license, hideAiToolsPromo, hide_ai_tools_promo: hideAiToolsPromo, hideAiTools: hideAiToolsPromo, showAiToolsInExpiryPopup: !hideAiToolsPromo, showAiTools: !hideAiToolsPromo, aiToolsVisible: !hideAiToolsPromo, flags: { hideAiToolsPromo, hideAiTools: hideAiToolsPromo } };
 }
 
 
@@ -878,17 +900,32 @@ async function getExtensionUpdateConfig() {
 }
 
 function buildLicenseResponseExtras(license, expiresOn, settings) {
+  const hidden = getLicensePromoHidden(license);
+  const visible = !hidden;
   return {
     expiresOn: expiresOn ? expiresOn.toISOString() : null,
     daysRemaining: expiresOn ? daysUntil(expiresOn) : null,
-    hideAiToolsPromo: getLicensePromoHidden(license),
-    showAiToolsInExpiryPopup: !getLicensePromoHidden(license),
+    hideAiToolsPromo: hidden,
+    hide_ai_tools_promo: hidden,
+    hideAiTools: hidden,
+    showAiToolsInExpiryPopup: visible,
+    showAiTools: visible,
+    aiToolsVisible: visible,
     expiryWarningDays: toInt(settings?.expiryWarningDays, 6),
     buyLicenseUrl: settings?.buyLicenseUrl || '',
+    flags: { hideAiToolsPromo: hidden, hideAiTools: hidden },
     licensePopup: {
       expiryWarningDays: toInt(settings?.expiryWarningDays, 6),
       buyLicenseUrl: settings?.buyLicenseUrl || '',
-      hideAiToolsPromo: getLicensePromoHidden(license),
+      hideAiToolsPromo: hidden,
+      hideAiTools: hidden,
+      showAiToolsInExpiryPopup: visible,
+    },
+    license: {
+      hideAiToolsPromo: hidden,
+      hideAiTools: hidden,
+      showAiToolsInExpiryPopup: visible,
+      expiresOn: expiresOn ? expiresOn.toISOString() : null,
     },
   };
 }
@@ -1009,7 +1046,12 @@ app.put('/api/admin/licenses/promo-visibility', requireAdmin, async (req, res) =
       {
         $set: {
           hideAiToolsPromo,
+          hide_ai_tools_promo: hideAiToolsPromo,
+          hideAiTools: hideAiToolsPromo,
           showAiToolsInExpiryPopup: !hideAiToolsPromo,
+          showAiTools: !hideAiToolsPromo,
+          aiToolsVisible: !hideAiToolsPromo,
+          flags: { hideAiToolsPromo, hideAiTools: hideAiToolsPromo },
           updated_at: new Date(),
         },
       }
